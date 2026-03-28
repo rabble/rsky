@@ -29,6 +29,7 @@ pub mod sequencer;
 pub mod well_known;
 pub mod xrpc_server;
 use crate::account_manager::{AccountManager, SharedAccountManager};
+use crate::auth_verifier::response_dpop_nonce;
 use crate::config::env_to_cfg;
 use crate::config::ServerConfig;
 use crate::crawlers::Crawlers;
@@ -70,7 +71,7 @@ pub struct SeqEventBroadcast {
 }
 
 extern crate rocket;
-use crate::apis::{app, bsky_api_get_forwarder, bsky_api_post_forwarder, com, ApiError};
+use crate::apis::{app, bsky_api_get_forwarder, bsky_api_post_forwarder, com, oauth, ApiError};
 use atrium_api::client::AtpServiceClient;
 use atrium_xrpc_client::reqwest::ReqwestClientBuilder;
 use diesel::sql_types::Int4;
@@ -189,7 +190,7 @@ impl Fairing for CORS {
         }
     }
 
-    async fn on_response<'r>(&self, _request: &'r Request<'_>, response: &mut Response<'r>) {
+    async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Response<'r>) {
         response.set_header(Header::new("Access-Control-Allow-Origin", "*"));
         response.set_header(Header::new(
             "Access-Control-Allow-Methods",
@@ -197,6 +198,9 @@ impl Fairing for CORS {
         ));
         response.set_header(Header::new("Access-Control-Allow-Headers", "*"));
         response.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
+        if let Some(dpop_nonce) = response_dpop_nonce(request) {
+            response.set_header(Header::new("DPoP-Nonce", dpop_nonce));
+        }
     }
 }
 
@@ -403,6 +407,7 @@ pub async fn build_rocket(cfg: Option<RocketConfig>) -> Rocket<Build> {
                 app::bsky::notification::register_push::register_push,
                 bsky_api_get_forwarder,
                 bsky_api_post_forwarder,
+                oauth::protected_resource::protected_resource,
                 well_known::well_known,
                 well_known::did_json,
                 all_options
@@ -425,7 +430,9 @@ pub async fn build_rocket(cfg: Option<RocketConfig>) -> Rocket<Build> {
 #[cfg(test)]
 mod tests {
     use crate::build_id_resolver;
-    use crate::config::{CoreConfig, IdentityConfig, InvitesConfig, ServerConfig, SubscriptionConfig};
+    use crate::config::{
+        CoreConfig, IdentityConfig, InvitesConfig, ServerConfig, SubscriptionConfig,
+    };
     use rsky_identity::did::did_resolver::ResolverKind;
     use std::time::Duration;
 
@@ -480,7 +487,10 @@ mod tests {
             other => panic!("unexpected plc resolver: {other:?}"),
         }
 
-        let cache = id_resolver.did.cache.expect("did cache should be configured");
+        let cache = id_resolver
+            .did
+            .cache
+            .expect("did cache should be configured");
         assert_eq!(cache.stale_ttl, Duration::from_millis(60_000));
         assert_eq!(cache.max_ttl, Duration::from_millis(120_000));
     }

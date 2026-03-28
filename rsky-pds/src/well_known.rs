@@ -100,8 +100,8 @@ pub async fn did_json(
     let did = format!("did:web:{}", hostname);
 
     // Derive public key multibase from the PDS signing key
-    let signing_key_hex = std::env::var("PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX")
-        .unwrap_or_default();
+    let signing_key_hex =
+        std::env::var("PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX").unwrap_or_default();
 
     let public_key_multibase = if !signing_key_hex.is_empty() {
         match derive_public_key_multibase(&signing_key_hex) {
@@ -141,14 +141,32 @@ pub async fn did_json(
     }))
 }
 
+#[derive(Serialize)]
+pub struct OAuthProtectedResourceMetadata {
+    resource: String,
+    authorization_servers: Vec<String>,
+}
+
+pub fn oauth_authorization_server_origin(cfg: &ServerConfig) -> String {
+    cfg.entryway
+        .as_ref()
+        .map(|entryway| entryway.url.clone())
+        .unwrap_or_else(|| cfg.service.public_url.clone())
+}
+
+pub fn oauth_protected_resource_metadata(cfg: &ServerConfig) -> OAuthProtectedResourceMetadata {
+    OAuthProtectedResourceMetadata {
+        resource: cfg.service.public_url.clone(),
+        authorization_servers: vec![oauth_authorization_server_origin(cfg)],
+    }
+}
+
 fn derive_public_key_multibase(hex_privkey: &str) -> Result<String, String> {
     use secp256k1::{Secp256k1, SecretKey};
 
-    let privkey_bytes = hex::decode(hex_privkey)
-        .map_err(|e| format!("hex decode: {e}"))?;
+    let privkey_bytes = hex::decode(hex_privkey).map_err(|e| format!("hex decode: {e}"))?;
     let secp = Secp256k1::new();
-    let sk = SecretKey::from_slice(&privkey_bytes)
-        .map_err(|e| format!("secret key: {e}"))?;
+    let sk = SecretKey::from_slice(&privkey_bytes).map_err(|e| format!("secret key: {e}"))?;
     let pk = sk.public_key(&secp);
     let compressed = pk.serialize(); // 33 bytes compressed
 
