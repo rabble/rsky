@@ -6,7 +6,6 @@ extern crate serde;
 use crate::read_after_write::viewer::{LocalViewer, LocalViewerCreator, LocalViewerCreatorParams};
 use crate::sequencer::Sequencer;
 use atrium_xrpc_client::reqwest::ReqwestClient;
-use event_emitter_rs::EventEmitter;
 use lazy_static::lazy_static;
 pub mod account_manager;
 pub mod actor_store;
@@ -30,7 +29,9 @@ pub mod sequencer;
 pub mod well_known;
 pub mod xrpc_server;
 use crate::account_manager::{AccountManager, SharedAccountManager};
+use crate::auth_verifier::response_dpop_nonce;
 use crate::config::env_to_cfg;
+use crate::config::ServerConfig;
 use crate::crawlers::Crawlers;
 use crate::db::DbConn;
 use crate::models::{ErrorCode, ErrorMessageResponse, ServerVersion};
@@ -61,14 +62,16 @@ pub struct SharedATPAgent {
     pub app_view_agent: Option<RwLock<AtpServiceClient<ReqwestClient>>>,
 }
 
-// Use lazy_static! because the size of EventEmitter is not known at compile time
-lazy_static! {
-    // Export the emitter with `pub` keyword
-    pub static ref EVENT_EMITTER: RwLock<EventEmitter> = RwLock::new(EventEmitter::new());
+use crate::sequencer::events::SeqEvt;
+
+/// Broadcast channel for firehose events. The background sequencer sends events
+/// here, and each subscribe_repos WebSocket subscriber receives them.
+pub struct SeqEventBroadcast {
+    pub sender: tokio::sync::broadcast::Sender<Vec<SeqEvt>>,
 }
 
 extern crate rocket;
-use crate::apis::{app, bsky_api_get_forwarder, bsky_api_post_forwarder, com, ApiError};
+use crate::apis::{app, bsky_api_get_forwarder, bsky_api_post_forwarder, com, oauth, ApiError};
 use atrium_api::client::AtpServiceClient;
 use atrium_xrpc_client::reqwest::ReqwestClientBuilder;
 use diesel::sql_types::Int4;
@@ -85,10 +88,10 @@ use rocket::response::status;
 use rocket::serde::json::Json;
 use rocket::shield::{NoSniff, Shield};
 use rocket::{Request, Response};
-use rsky_common::env::env_list;
 use rsky_identity::types::{DidCache, IdentityResolverOpts};
 use rsky_identity::IdResolver;
 use std::env;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 pub struct CORS;
@@ -120,9 +123,17 @@ async fn robots() -> &'static str {
     "# Hello!\n\n# Crawling the public API is allowed\nUser-agent: *\nAllow: /"
 }
 
-#[tracing::instrument(skip_all)]
 #[get("/xrpc/_health")]
-async fn health(
+async fn health_live() -> Json<ServerVersion> {
+    let env_version = env::var("VERSION").unwrap_or("0.3.0-beta.3".into());
+    Json(ServerVersion {
+        version: env_version,
+    })
+}
+
+#[tracing::instrument(skip_all)]
+#[get("/xrpc/_health/ready")]
+async fn health_ready(
     connection: DbConn,
 ) -> Result<Json<ServerVersion>, status::Custom<Json<ErrorMessageResponse>>> {
     let result = connection
@@ -179,7 +190,7 @@ impl Fairing for CORS {
         }
     }
 
-    async fn on_response<'r>(&self, _request: &'r Request<'_>, response: &mut Response<'r>) {
+    async fn on_response<'r>(&self, request: &'r Request<'_>, response: &mut Response<'r>) {
         response.set_header(Header::new("Access-Control-Allow-Origin", "*"));
         response.set_header(Header::new(
             "Access-Control-Allow-Methods",
@@ -187,11 +198,28 @@ impl Fairing for CORS {
         ));
         response.set_header(Header::new("Access-Control-Allow-Headers", "*"));
         response.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
+        if let Some(dpop_nonce) = response_dpop_nonce(request) {
+            response.set_header(Header::new("DPoP-Nonce", dpop_nonce));
+        }
     }
 }
 
 pub struct RocketConfig {
     pub db_url: String,
+}
+
+fn build_id_resolver(cfg: &ServerConfig) -> SharedIdResolver {
+    SharedIdResolver {
+        id_resolver: RwLock::new(IdResolver::new(IdentityResolverOpts {
+            timeout: Some(Duration::from_millis(cfg.identity.resolver_timeout)),
+            plc_url: Some(cfg.identity.plc_url.clone()),
+            did_cache: Some(DidCache::new(
+                Some(Duration::from_millis(cfg.identity.cache_state_ttl)),
+                Some(Duration::from_millis(cfg.identity.cache_max_ttl)),
+            )),
+            backup_nameservers: cfg.identity.handle_backup_name_servers.clone(),
+        })),
+    }
 }
 
 pub async fn build_rocket(cfg: Option<RocketConfig>) -> Rocket<Build> {
@@ -214,6 +242,11 @@ pub async fn build_rocket(cfg: Option<RocketConfig>) -> Rocket<Build> {
         .merge(("limits", Limits::default().limit("file", 100.mebibytes())));
     let cfg = env_to_cfg();
 
+    let (seq_tx, _) = tokio::sync::broadcast::channel::<Vec<SeqEvt>>(256);
+    let seq_broadcast = SeqEventBroadcast {
+        sender: seq_tx.clone(),
+    };
+
     let sequencer = SharedSequencer {
         sequencer: RwLock::new(Sequencer::new(
             Crawlers::new(cfg.service.hostname.clone(), cfg.crawlers.clone()),
@@ -221,23 +254,33 @@ pub async fn build_rocket(cfg: Option<RocketConfig>) -> Rocket<Build> {
         )),
     };
     let mut background_sequencer = sequencer.sequencer.write().await.clone();
-    tokio::spawn(async move { background_sequencer.start().await });
+    std::thread::Builder::new()
+        .name("sequencer".into())
+        .spawn(move || {
+            eprintln!("[sequencer] thread started");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build sequencer runtime");
+            rt.block_on(async move {
+                eprintln!("[sequencer] runtime ready, calling start()");
+                match background_sequencer.start(seq_tx).await {
+                    Ok(()) => eprintln!("[sequencer] start() returned Ok"),
+                    Err(e) => {
+                        eprintln!("[sequencer] start() returned Err: {e}");
+                        tracing::error!("Sequencer exited with error: {e}");
+                    }
+                }
+            });
+        })
+        .expect("failed to spawn sequencer thread");
 
     let aws_sdk_config = aws_config::from_env()
         .endpoint_url(env::var("AWS_ENDPOINT").unwrap_or("localhost".to_owned()))
         .load()
         .await;
 
-    let id_resolver = SharedIdResolver {
-        id_resolver: RwLock::new(IdResolver::new(IdentityResolverOpts {
-            timeout: None,
-            plc_url: Some(
-                env::var("PDS_DID_PLC_URL").unwrap_or("https://plc.directory".to_owned()),
-            ),
-            did_cache: Some(DidCache::new(None, None)),
-            backup_nameservers: Some(env_list("PDS_HANDLE_BACKUP_NAMESERVERS")),
-        })),
-    };
+    let id_resolver = build_id_resolver(&cfg);
 
     // Keeping unused for other config purposes for now.
     let app_view_agent = match cfg.bsky_app_view {
@@ -288,7 +331,8 @@ pub async fn build_rocket(cfg: Option<RocketConfig>) -> Rocket<Build> {
             routes![
                 index,
                 robots,
-                health,
+                health_live,
+                health_ready,
                 com::atproto::admin::delete_account::delete_account,
                 com::atproto::admin::disable_account_invites::disable_account_invites,
                 com::atproto::admin::disable_invite_codes::disable_invite_codes,
@@ -363,7 +407,9 @@ pub async fn build_rocket(cfg: Option<RocketConfig>) -> Rocket<Build> {
                 app::bsky::notification::register_push::register_push,
                 bsky_api_get_forwarder,
                 bsky_api_post_forwarder,
+                oauth::protected_resource::protected_resource,
                 well_known::well_known,
+                well_known::did_json,
                 all_options
             ],
         )
@@ -372,10 +418,80 @@ pub async fn build_rocket(cfg: Option<RocketConfig>) -> Rocket<Build> {
         .attach(DbConn::fairing())
         .attach(shield)
         .manage(sequencer)
+        .manage(seq_broadcast)
         .manage(aws_sdk_config)
         .manage(id_resolver)
         .manage(cfg)
         .manage(local_viewer)
         .manage(app_view_agent)
         .manage(account_manager)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::build_id_resolver;
+    use crate::config::{
+        CoreConfig, IdentityConfig, InvitesConfig, ServerConfig, SubscriptionConfig,
+    };
+    use rsky_identity::did::did_resolver::ResolverKind;
+    use std::time::Duration;
+
+    #[test]
+    fn build_id_resolver_uses_identity_config_timeout_and_cache_ttls() {
+        let cfg = ServerConfig {
+            service: CoreConfig {
+                port: 8000,
+                hostname: "pds.staging.dvines.org".to_string(),
+                public_url: "https://pds.staging.dvines.org".to_string(),
+                did: "did:web:pds.staging.dvines.org".to_string(),
+                version: None,
+                privacy_policy_url: None,
+                terms_of_service_url: None,
+                accepting_imports: true,
+                blob_upload_limit: 1024,
+                contact_email_address: None,
+                dev_mode: false,
+            },
+            mod_service: None,
+            report_service: None,
+            bsky_app_view: None,
+            subscription: SubscriptionConfig {
+                max_buffer: 100,
+                repo_backfill_limit_ms: 1000,
+            },
+            invites: InvitesConfig {
+                required: false,
+                interval: None,
+                epoch: None,
+            },
+            identity: IdentityConfig {
+                plc_url: "https://plc.directory".to_string(),
+                resolver_timeout: 30_000,
+                cache_state_ttl: 60_000,
+                cache_max_ttl: 120_000,
+                recovery_did_key: None,
+                service_handle_domains: vec![".staging.dvines.org".to_string()],
+                handle_backup_name_servers: Some(vec!["1.1.1.1".to_string()]),
+                enable_did_doc_with_session: false,
+            },
+            crawlers: vec![],
+        };
+
+        let id_resolver = build_id_resolver(&cfg).id_resolver.into_inner();
+
+        match id_resolver.did.methods.get("plc") {
+            Some(ResolverKind::Plc(plc)) => {
+                assert_eq!(plc.plc_url, "https://plc.directory");
+                assert_eq!(plc.timeout, Duration::from_millis(30_000));
+            }
+            other => panic!("unexpected plc resolver: {other:?}"),
+        }
+
+        let cache = id_resolver
+            .did
+            .cache
+            .expect("did cache should be configured");
+        assert_eq!(cache.stale_ttl, Duration::from_millis(60_000));
+        assert_eq!(cache.max_ttl, Duration::from_millis(120_000));
+    }
 }

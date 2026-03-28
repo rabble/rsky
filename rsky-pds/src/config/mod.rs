@@ -7,6 +7,7 @@ use rsky_common::time::{DAY, HOUR, SECOND};
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerConfig {
     pub service: CoreConfig,
+    pub entryway: Option<EntrywayConfig>,
     pub mod_service: Option<ServiceConfig>,
     pub report_service: Option<ServiceConfig>,
     pub bsky_app_view: Option<ServiceConfig>,
@@ -22,6 +23,13 @@ pub struct ServiceConfig {
     pub url: String,
     pub did: String,
     pub cdn_url_pattern: Option<String>, // for BksyAppViewConfig, otherwise None
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntrywayConfig {
+    pub url: String,
+    pub did: Option<String>,
+    pub jwt_public_key_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +123,12 @@ pub fn env_to_cfg() -> ServerConfig {
             cdn_url_pattern: env_str("PDS_BSKY_APP_VIEW_CDN_URL_PATTERN"),
         }),
     };
+    let entryway_cfg: Option<EntrywayConfig> =
+        env_str("PDS_ENTRYWAY_URL").map(|entryway_url| EntrywayConfig {
+            url: entryway_url,
+            did: env_str("PDS_ENTRYWAY_DID"),
+            jwt_public_key_hex: env_str("PDS_ENTRYWAY_JWT_PUBLIC_KEY_HEX"),
+        });
     let mod_service_cfg: Option<ServiceConfig> = match env_str("PDS_MOD_SERVICE_URL") {
         None => None,
         Some(mod_service_url) => Some(ServiceConfig {
@@ -160,6 +174,7 @@ pub fn env_to_cfg() -> ServerConfig {
 
     ServerConfig {
         service: service_cfg,
+        entryway: entryway_cfg,
         mod_service: mod_service_cfg,
         report_service: report_service_cfg,
         bsky_app_view: bsky_app_view_cfg,

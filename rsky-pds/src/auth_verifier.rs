@@ -2,12 +2,21 @@ use crate::account_manager::helpers::account::{ActorAccount, AvailabilityFlags};
 use crate::account_manager::helpers::auth::CustomClaimObj;
 use crate::account_manager::AccountManager;
 use crate::apis::ApiError;
+use crate::config::ServerConfig;
 use crate::xrpc_server::auth::{verify_jwt as verify_service_jwt_server, ServiceJwtPayload};
 use crate::SharedIdResolver;
 use anyhow::{bail, Result};
-use base64::{engine::general_purpose::STANDARD as base64pad, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD as base64pad, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use jwt_simple::claims::Audiences;
 use jwt_simple::prelude::*;
+use lazy_static::lazy_static;
+use p256::ecdsa::signature::hazmat::PrehashVerifier;
+use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
+use p256::EncodedPoint;
+use rand::RngCore;
 use rocket::http::Status;
 use rocket::request::{FromRequest, Outcome, Request};
 use rocket::State;
@@ -15,12 +24,26 @@ use rsky_common::env::env_str;
 use rsky_common::get_verification_material;
 use rsky_identity::did::atproto_data::get_did_key_from_multibase;
 use rsky_identity::types::DidDocument;
-use secp256k1::{Keypair, Secp256k1, SecretKey};
+use secp256k1::{ecdsa::Signature, Keypair, Message, Secp256k1, SecretKey};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::env;
 use std::str;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use url::Url;
 
 const INFINITY: u64 = u64::MAX;
+const DPOP_REPLAY_WINDOW_SECONDS: i64 = 300;
+const DPOP_MAX_CLOCK_SKEW_SECONDS: i64 = 60;
+const DPOP_NONCE_TTL_SECONDS: i64 = 300;
+
+lazy_static! {
+    static ref DPOP_REPLAY_CACHE: Mutex<HashMap<String, i64>> = Mutex::new(HashMap::new());
+    static ref DPOP_NONCE_CACHE: Mutex<HashMap<String, (String, i64)>> = Mutex::new(HashMap::new());
+}
 
 #[derive(PartialEq, Clone, Debug)]
 pub enum AuthScope {
@@ -116,10 +139,60 @@ pub struct BasicAuth {
 pub struct JwtPayload {
     pub scope: AuthScope,
     pub sub: Option<String>,
+    pub iss: Option<String>,
     pub aud: Option<Audiences>,
     pub exp: Option<Duration>,
     pub iat: Option<Duration>,
     pub jti: Option<String>,
+    pub cnf_jkt: Option<String>,
+    pub external_issuer: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthorizationScheme {
+    Bearer,
+    Dpop,
+}
+
+enum DpopProofKey {
+    Secp256k1(secp256k1::PublicKey),
+    P256(P256VerifyingKey),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct AccessTokenConfirmationClaim {
+    #[serde(default)]
+    jkt: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ExternalAccessTokenClaims {
+    #[serde(default)]
+    scope: String,
+    #[serde(default)]
+    lxm: Option<String>,
+    #[serde(default)]
+    cnf: Option<AccessTokenConfirmationClaim>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DpopJwkHeader {
+    #[serde(default)]
+    typ: Option<String>,
+    alg: String,
+    jwk: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct DpopProofClaims {
+    jti: String,
+    htm: String,
+    htu: String,
+    iat: i64,
+    #[serde(default)]
+    ath: Option<String>,
+    #[serde(default)]
+    nonce: Option<String>,
 }
 
 #[derive(Error, Debug)]
@@ -625,6 +698,12 @@ pub struct AdminToken {
     pub access: AccessOutput,
 }
 
+fn admin_password_from_env() -> Option<String> {
+    env::var("PDS_ADMIN_PASSWORD")
+        .ok()
+        .or_else(|| env::var("PDS_ADMIN_PASS").ok())
+}
+
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for AdminToken {
     type Error = AuthError;
@@ -638,8 +717,16 @@ impl<'r> FromRequest<'r> for AdminToken {
             )),
             Some(parsed) => {
                 let BasicAuth { username, password } = parsed;
+                let expected_password = match admin_password_from_env() {
+                    Some(password) => password,
+                    None => {
+                        let error = AuthError::AuthRequired("BadAuth".to_string());
+                        req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
+                        return Outcome::Error((Status::BadRequest, error));
+                    }
+                };
 
-                if username != "admin" || password != env::var("PDS_ADMIN_PASS").unwrap() {
+                if username != "admin" || password != expected_password {
                     let error = AuthError::AuthRequired("BadAuth".to_string());
                     req.local_cache(|| Some(ApiError::InvalidRequest(error.to_string())));
                     Outcome::Error((Status::BadRequest, error))
@@ -739,54 +826,18 @@ pub async fn validate_bearer_token<'r>(
     scopes: Vec<AuthScope>,
     verify_options: Option<VerificationOptions>,
 ) -> Result<ValidatedBearer> {
-    let token = bearer_token_from_req(request)?;
-    if let Some(token) = token {
-        let secp = Secp256k1::new();
-        let private_key = env::var("PDS_JWT_KEY_K256_PRIVATE_KEY_HEX").unwrap();
-        let secret_key =
-            SecretKey::from_slice(&hex::decode(private_key.as_bytes()).unwrap()).unwrap();
-        let jwt_key = Keypair::from_secret_key(&secp, &secret_key);
-        let payload = verify_jwt(token.clone(), jwt_key, verify_options).await?;
-        let JwtPayload {
-            sub, aud, scope, ..
-        } = payload.clone();
-        let sub = sub.unwrap();
-        let aud = aud.unwrap();
-        if !sub.starts_with("did:") {
-            bail!("Malformed token")
-        }
-        if let Audiences::AsString(aud) = aud {
-            if !aud.starts_with("did:") {
-                bail!("Malformed token")
-            }
-            if scopes.len() > 0 && !scopes.contains(&scope) {
-                bail!("Bad token scope")
-                /*{
-                    "error": "InvalidToken",
-                    "message": "Bad token scope"
-                }*/
-            }
-            Ok(ValidatedBearer {
-                did: sub,
-                scope,
-                audience: Some(aud),
-                token,
-                payload,
-            })
-        } else {
-            bail!("Malformed token")
-        }
-    } else {
-        bail!("AuthMissing")
-    }
+    let token = bearer_token_from_req(request)?.ok_or_else(|| anyhow::anyhow!("AuthMissing"))?;
+    validate_token_string(request, token, scopes, verify_options).await
 }
 
-// @TODO: Implement DPop/OAuth
 pub async fn validate_access_token<'r>(
     request: &'r Request<'_>,
     scopes: Vec<AuthScope>,
     opts: Option<ValidateAccessTokenOpts>,
 ) -> Result<AccessOutput> {
+    let (auth_scheme, token) =
+        authorization_token_from_req(request)?.ok_or_else(|| anyhow::anyhow!("AuthMissing"))?;
+
     let mut options = VerificationOptions::default();
     options.allowed_audiences = Some(HashSet::from_strings(&[
         env::var("PDS_SERVICE_DID").unwrap()
@@ -794,10 +845,34 @@ pub async fn validate_access_token<'r>(
     let ValidatedBearer {
         did,
         scope,
-        token,
+        token: validated_token,
         audience,
-        ..
-    } = validate_bearer_token(request, scopes, Some(options)).await?;
+        payload,
+    } = validate_token_string(request, token, scopes, Some(options)).await?;
+
+    if payload.external_issuer {
+        if auth_scheme != AuthorizationScheme::Dpop {
+            bail!("AuthRequired: external access tokens require Authorization: DPoP");
+        }
+        let expected_jkt = payload
+            .cnf_jkt
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("BadJwt: externally issued token missing cnf.jkt"))?;
+        let dpop_proof = match request.headers().get_one("DPoP") {
+            Some(proof) => proof,
+            None => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|_| anyhow::anyhow!("InternalServerError: invalid system clock"))?
+                    .as_secs() as i64;
+                let nonce_key = dpop_nonce_cache_key(&validated_token);
+                issue_dpop_nonce(request, &nonce_key, now)?;
+                bail!("AuthRequired: use_dpop_nonce");
+            }
+        };
+        verify_dpop_proof(request, dpop_proof, &validated_token, expected_jkt)?;
+    }
+
     let ValidateAccessTokenOpts {
         check_takedown,
         check_deactivated,
@@ -865,8 +940,382 @@ pub async fn validate_access_token<'r>(
             iss: None,
             is_privileged: None,
         }),
-        artifacts: Some(token),
+        artifacts: Some(validated_token),
     })
+}
+
+async fn validate_token_string<'r>(
+    request: &'r Request<'_>,
+    token: String,
+    scopes: Vec<AuthScope>,
+    verify_options: Option<VerificationOptions>,
+) -> Result<ValidatedBearer> {
+    let secp = Secp256k1::new();
+    // Try JWT key first (for session tokens)
+    let jwt_private_key = env::var("PDS_JWT_KEY_K256_PRIVATE_KEY_HEX").unwrap();
+    let jwt_secret_key =
+        SecretKey::from_slice(&hex::decode(jwt_private_key.as_bytes()).unwrap()).unwrap();
+    let jwt_key = Keypair::from_secret_key(&secp, &jwt_secret_key);
+    let cfg = request.guard::<&State<ServerConfig>>().await.unwrap();
+    let payload = match verify_jwt(token.clone(), jwt_key, verify_options.clone()).await {
+        Ok(payload) => payload,
+        Err(jwt_err) => {
+            // Fall back to repo signing key (for service auth tokens
+            // that come back from external services like video.bsky.app)
+            let repo_key_hex =
+                env::var("PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX").unwrap_or_default();
+            let repo_result = if repo_key_hex.is_empty() {
+                Err(jwt_err)
+            } else {
+                let repo_secret_key =
+                    SecretKey::from_slice(&hex::decode(repo_key_hex.as_bytes()).unwrap()).unwrap();
+                let repo_key = Keypair::from_secret_key(&secp, &repo_secret_key);
+                verify_jwt(token.clone(), repo_key, verify_options.clone()).await
+            };
+
+            match repo_result {
+                Ok(payload) => payload,
+                Err(repo_err) => {
+                    match verify_external_entryway_jwt(token.clone(), cfg, verify_options.clone())
+                        .await
+                    {
+                        Ok(payload) => payload,
+                        Err(entryway_err)
+                            if entryway_err
+                                .to_string()
+                                .contains("Signature tag didn't verify") =>
+                        {
+                            return Err(repo_err);
+                        }
+                        Err(entryway_err) => return Err(entryway_err),
+                    }
+                }
+            }
+        }
+    };
+    let JwtPayload {
+        sub, aud, scope, ..
+    } = payload.clone();
+    // Service auth tokens use 'iss' (mapped to 'sub' by jwt_simple) but may also
+    // have it only in the issuer field. Fall back to empty if not present.
+    let sub = match sub {
+        Some(s) => s,
+        None => bail!("BadJwt: missing sub/iss in token"),
+    };
+    let aud = match aud {
+        Some(a) => a,
+        None => bail!("BadJwt: missing aud in token"),
+    };
+    if !sub.starts_with("did:") {
+        bail!("Malformed token")
+    }
+    if let Audiences::AsString(aud) = aud {
+        if !aud.starts_with("did:") {
+            bail!("Malformed token")
+        }
+        if !scopes.is_empty() && !scopes.contains(&scope) {
+            bail!("Bad token scope")
+        }
+        Ok(ValidatedBearer {
+            did: sub,
+            scope,
+            audience: Some(aud),
+            token,
+            payload,
+        })
+    } else {
+        bail!("Malformed token")
+    }
+}
+
+fn verify_dpop_proof(
+    request: &Request<'_>,
+    dpop_proof: &str,
+    access_token: &str,
+    expected_jkt: &str,
+) -> Result<()> {
+    let parts: Vec<&str> = dpop_proof.split('.').collect();
+    if parts.len() != 3 {
+        bail!("BadJwt: malformed DPoP proof");
+    }
+
+    let header: DpopJwkHeader = decode_base64url_json(parts[0])?;
+    let alg = header.alg.to_ascii_uppercase();
+    if alg != "ES256" && alg != "ES256K" {
+        bail!("BadJwt: unsupported DPoP alg");
+    }
+    if let Some(typ) = header.typ.as_deref() {
+        if typ.to_ascii_lowercase() != "dpop+jwt" {
+            bail!("BadJwt: invalid DPoP typ");
+        }
+    }
+
+    let (proof_key, computed_jkt) = parse_jwk_and_thumbprint(&header.jwk)?;
+    if computed_jkt != expected_jkt {
+        bail!("BadJwt: DPoP key does not match access token cnf.jkt");
+    }
+
+    verify_compact_jws(parts[0], parts[1], parts[2], &alg, &proof_key)?;
+
+    let claims: DpopProofClaims = decode_base64url_json(parts[1])?;
+    if claims.htm.to_uppercase() != request.method().as_str().to_uppercase() {
+        bail!("BadJwt: DPoP htm mismatch");
+    }
+    validate_htu(request, &claims.htu)?;
+
+    let expected_ath = URL_SAFE_NO_PAD.encode(Sha256::digest(access_token.as_bytes()));
+    let actual_ath = claims
+        .ath
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("BadJwt: missing DPoP ath"))?;
+    if actual_ath != expected_ath {
+        bail!("BadJwt: DPoP ath mismatch");
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| anyhow::anyhow!("InternalServerError: invalid system clock"))?
+        .as_secs() as i64;
+    if claims.iat > now + DPOP_MAX_CLOCK_SKEW_SECONDS {
+        bail!("BadJwt: DPoP iat is in the future");
+    }
+    if now - claims.iat > DPOP_REPLAY_WINDOW_SECONDS {
+        bail!("BadJwt: DPoP iat is outside replay window");
+    }
+
+    let nonce_cache_key = dpop_nonce_cache_key(access_token);
+    let expected_nonce = current_dpop_nonce(&nonce_cache_key, now)?;
+    if expected_nonce.is_none() {
+        issue_dpop_nonce(request, &nonce_cache_key, now)?;
+        bail!("AuthRequired: use_dpop_nonce");
+    }
+    let expected_nonce = expected_nonce.unwrap();
+    let proof_nonce = claims
+        .nonce
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("AuthRequired: use_dpop_nonce"))?;
+    if proof_nonce != expected_nonce {
+        issue_dpop_nonce(request, &nonce_cache_key, now)?;
+        bail!("AuthRequired: use_dpop_nonce");
+    }
+
+    let mut replay_cache = DPOP_REPLAY_CACHE
+        .lock()
+        .map_err(|_| anyhow::anyhow!("InternalServerError: DPoP replay cache lock poisoned"))?;
+    replay_cache.retain(|_, ts| now - *ts <= DPOP_REPLAY_WINDOW_SECONDS);
+    if replay_cache.contains_key(&claims.jti) {
+        bail!("BadJwt: replayed DPoP proof");
+    }
+    replay_cache.insert(claims.jti, now);
+
+    // Rotate nonce for next request and return it in response headers.
+    issue_dpop_nonce(request, &nonce_cache_key, now)?;
+
+    Ok(())
+}
+
+fn decode_base64url_json<T: for<'de> Deserialize<'de>>(value: &str) -> Result<T> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| anyhow::anyhow!("BadJwt: malformed base64url segment"))?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn parse_jwk_and_thumbprint(jwk: &serde_json::Value) -> Result<(DpopProofKey, String)> {
+    let kty = jwk
+        .get("kty")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("BadJwt: DPoP jwk missing kty"))?;
+    let crv = jwk
+        .get("crv")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("BadJwt: DPoP jwk missing crv"))?;
+    let x = jwk
+        .get("x")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("BadJwt: DPoP jwk missing x"))?;
+    let y = jwk
+        .get("y")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("BadJwt: DPoP jwk missing y"))?;
+
+    if kty != "EC" {
+        bail!("BadJwt: unsupported DPoP jwk kty");
+    }
+
+    let x_bytes = URL_SAFE_NO_PAD
+        .decode(x)
+        .map_err(|_| anyhow::anyhow!("BadJwt: invalid DPoP jwk x"))?;
+    let y_bytes = URL_SAFE_NO_PAD
+        .decode(y)
+        .map_err(|_| anyhow::anyhow!("BadJwt: invalid DPoP jwk y"))?;
+    if x_bytes.len() != 32 || y_bytes.len() != 32 {
+        bail!("BadJwt: invalid DPoP jwk coordinate length");
+    }
+
+    let mut uncompressed = Vec::with_capacity(65);
+    uncompressed.push(0x04);
+    uncompressed.extend_from_slice(&x_bytes);
+    uncompressed.extend_from_slice(&y_bytes);
+
+    // RFC 7638 key thumbprint canonical order.
+    let canonical = format!("{{\"crv\":\"{crv}\",\"kty\":\"{kty}\",\"x\":\"{x}\",\"y\":\"{y}\"}}");
+    let digest = Sha256::digest(canonical.as_bytes());
+    let jkt = URL_SAFE_NO_PAD.encode(digest);
+
+    let proof_key = match crv {
+        "secp256k1" => DpopProofKey::Secp256k1(
+            secp256k1::PublicKey::from_slice(&uncompressed)
+                .map_err(|_| anyhow::anyhow!("BadJwt: invalid secp256k1 DPoP key"))?,
+        ),
+        "P-256" => {
+            let point = EncodedPoint::from_affine_coordinates(
+                p256::FieldBytes::from_slice(&x_bytes),
+                p256::FieldBytes::from_slice(&y_bytes),
+                false,
+            );
+            let verifying_key = P256VerifyingKey::from_encoded_point(&point)
+                .map_err(|_| anyhow::anyhow!("BadJwt: invalid P-256 DPoP key"))?;
+            DpopProofKey::P256(verifying_key)
+        }
+        _ => bail!("BadJwt: unsupported DPoP jwk curve"),
+    };
+
+    Ok((proof_key, jkt))
+}
+
+fn verify_compact_jws(
+    header_b64: &str,
+    payload_b64: &str,
+    signature_b64: &str,
+    alg: &str,
+    proof_key: &DpopProofKey,
+) -> Result<()> {
+    let signature_bytes = URL_SAFE_NO_PAD
+        .decode(signature_b64)
+        .map_err(|_| anyhow::anyhow!("BadJwt: malformed DPoP signature"))?;
+    if signature_bytes.len() != 64 {
+        bail!("BadJwt: invalid DPoP signature length");
+    }
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let digest = Sha256::digest(signing_input.as_bytes());
+
+    match (alg.to_ascii_uppercase().as_str(), proof_key) {
+        ("ES256K", DpopProofKey::Secp256k1(public_key)) => {
+            let signature = Signature::from_compact(&signature_bytes)
+                .map_err(|_| anyhow::anyhow!("BadJwt: invalid DPoP signature format"))?;
+            let message = Message::from_digest_slice(digest.as_ref())
+                .map_err(|_| anyhow::anyhow!("BadJwt: invalid DPoP signing input"))?;
+            Secp256k1::verification_only()
+                .verify_ecdsa(&message, &signature, public_key)
+                .map_err(|_| anyhow::anyhow!("BadJwt: DPoP signature verification failed"))?;
+        }
+        ("ES256", DpopProofKey::P256(public_key)) => {
+            let signature = P256Signature::from_slice(&signature_bytes)
+                .map_err(|_| anyhow::anyhow!("BadJwt: invalid DPoP ES256 signature format"))?;
+            public_key
+                .verify_prehash(digest.as_slice(), &signature)
+                .map_err(|_| anyhow::anyhow!("BadJwt: DPoP signature verification failed"))?;
+        }
+        ("ES256", _) => bail!("BadJwt: ES256 requires P-256 DPoP key"),
+        ("ES256K", _) => bail!("BadJwt: ES256K requires secp256k1 DPoP key"),
+        _ => bail!("BadJwt: unsupported DPoP alg"),
+    }
+
+    Ok(())
+}
+
+fn request_relative_uri(request: &Request<'_>) -> String {
+    let mut uri = request.uri().path().to_string();
+    if let Some(query) = request.uri().query() {
+        uri.push('?');
+        uri.push_str(query.as_str());
+    }
+    uri
+}
+
+fn validate_htu(request: &Request<'_>, htu: &str) -> Result<()> {
+    let parsed = Url::parse(htu).map_err(|_| anyhow::anyhow!("BadJwt: invalid DPoP htu"))?;
+
+    let expected_scheme = request
+        .headers()
+        .get_one("X-Forwarded-Proto")
+        .unwrap_or("https");
+    if parsed.scheme() != expected_scheme {
+        bail!("BadJwt: DPoP htu scheme mismatch");
+    }
+
+    if let Some(host) = request.headers().get_one("Host") {
+        let parsed_host = match parsed.port() {
+            Some(port) => format!("{}:{port}", parsed.host_str().unwrap_or_default()),
+            None => parsed.host_str().unwrap_or_default().to_string(),
+        };
+        if !same_host(&parsed_host, host, parsed.scheme()) {
+            bail!("BadJwt: DPoP htu host mismatch");
+        }
+    }
+
+    let mut parsed_relative = parsed.path().to_string();
+    if let Some(query) = parsed.query() {
+        parsed_relative.push('?');
+        parsed_relative.push_str(query);
+    }
+    if parsed_relative != request_relative_uri(request) {
+        bail!("BadJwt: DPoP htu path mismatch");
+    }
+    Ok(())
+}
+
+fn same_host(provided: &str, expected: &str, scheme: &str) -> bool {
+    let normalize = |host: &str| {
+        if (scheme == "https" && host.ends_with(":443"))
+            || (scheme == "http" && host.ends_with(":80"))
+        {
+            host.rsplit_once(':')
+                .map(|(h, _)| h.to_string())
+                .unwrap_or_else(|| host.to_string())
+        } else {
+            host.to_string()
+        }
+    };
+    normalize(provided).eq_ignore_ascii_case(&normalize(expected))
+}
+
+fn dpop_nonce_cache_key(access_token: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(access_token.as_bytes()))
+}
+
+fn issue_dpop_nonce(request: &Request<'_>, nonce_key: &str, now: i64) -> Result<String> {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let nonce = URL_SAFE_NO_PAD.encode(bytes);
+    let mut nonce_cache = DPOP_NONCE_CACHE
+        .lock()
+        .map_err(|_| anyhow::anyhow!("InternalServerError: DPoP nonce cache lock poisoned"))?;
+    nonce_cache.retain(|_, (_, ts)| now - *ts <= DPOP_NONCE_TTL_SECONDS);
+    nonce_cache.insert(nonce_key.to_string(), (nonce.clone(), now));
+    set_dpop_nonce_for_response(request, nonce.clone());
+    Ok(nonce)
+}
+
+fn current_dpop_nonce(nonce_key: &str, now: i64) -> Result<Option<String>> {
+    let mut nonce_cache = DPOP_NONCE_CACHE
+        .lock()
+        .map_err(|_| anyhow::anyhow!("InternalServerError: DPoP nonce cache lock poisoned"))?;
+    nonce_cache.retain(|_, (_, ts)| now - *ts <= DPOP_NONCE_TTL_SECONDS);
+    Ok(nonce_cache.get(nonce_key).map(|(nonce, _)| nonce.clone()))
+}
+
+fn set_dpop_nonce_for_response(request: &Request<'_>, nonce: String) {
+    let cache = request.local_cache(|| Mutex::new(None::<String>));
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(nonce);
+    }
+}
+
+pub fn response_dpop_nonce(request: &Request<'_>) -> Option<String> {
+    let cache = request.local_cache(|| Mutex::new(None::<String>));
+    cache.lock().ok().and_then(|guard| (*guard).clone())
 }
 
 pub async fn verify_service_jwt<'r>(
@@ -931,7 +1380,25 @@ pub fn is_user_or_admin(auth: AccessOutput, did: &String) -> bool {
 // ---------
 
 const BEARER: &str = "Bearer ";
+const DPOP: &str = "DPoP ";
 const BASIC: &str = "Basic ";
+
+fn authorization_token_from_req(
+    request: &Request,
+) -> Result<Option<(AuthorizationScheme, String)>> {
+    match request.headers().get_one("authorization") {
+        Some(header) if header.starts_with(DPOP) => {
+            let slice = &header[DPOP.len()..];
+            Ok(Some((AuthorizationScheme::Dpop, slice.to_string())))
+        }
+        Some(header) if header.starts_with(BEARER) => {
+            let slice = &header[BEARER.len()..];
+            Ok(Some((AuthorizationScheme::Bearer, slice.to_string())))
+        }
+        Some(_) => Ok(None),
+        None => Ok(None),
+    }
+}
 
 pub fn is_bearer_token(request: &Request) -> bool {
     match request.headers().get_one("Authorization") {
@@ -948,14 +1415,10 @@ pub fn is_basic_token(request: &Request) -> bool {
 }
 
 pub fn bearer_token_from_req(request: &Request) -> Result<Option<String>> {
-    match request.headers().get_one("authorization") {
-        Some(header) if !header.starts_with("Bearer ") => Ok(None),
-        Some(header) => {
-            let slice = &header["Bearer ".len()..];
-            Ok(Some(slice.to_string()))
-        }
-        None => Ok(None),
-    }
+    Ok(match authorization_token_from_req(request)? {
+        Some((AuthorizationScheme::Bearer, token)) => Some(token),
+        _ => None,
+    })
 }
 
 pub async fn verify_jwt(
@@ -967,13 +1430,72 @@ pub async fn verify_jwt(
     let public_key = key.public_key();
     let claims = public_key.verify_token::<CustomClaimObj>(&jwt, verify_options)?;
 
+    let scope = if claims.custom.scope.is_empty() {
+        // Service auth tokens (from video.bsky.app etc.) don't have scope,
+        // they have lxm instead. Default to Access scope.
+        AuthScope::Access
+    } else {
+        AuthScope::from_str(&claims.custom.scope)?
+    };
+    // Service auth tokens (e.g. from video.bsky.app) use 'iss' instead of 'sub'.
+    // Fall back to issuer when subject is absent.
+    let iss = claims.issuer.clone();
+    let sub = claims.subject.or_else(|| iss.clone());
     Ok(JwtPayload {
-        scope: AuthScope::from_str(&claims.custom.scope)?,
-        sub: claims.subject,
+        scope,
+        sub,
+        iss,
         aud: claims.audiences,
         exp: claims.expires_at,
         iat: claims.issued_at,
         jti: claims.jwt_id,
+        cnf_jkt: None,
+        external_issuer: false,
+    })
+}
+
+async fn verify_external_entryway_jwt(
+    jwt: String,
+    cfg: &State<ServerConfig>,
+    verify_options: Option<VerificationOptions>,
+) -> Result<JwtPayload> {
+    let entryway = cfg.entryway.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("UntrustedIss: no external authorization server configured")
+    })?;
+    let public_key_hex = entryway.jwt_public_key_hex.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("UntrustedIss: external authorization server key is not configured")
+    })?;
+    let public_key_bytes = hex::decode(public_key_hex.as_bytes())?;
+    let public_key = ES256kPublicKey::from_bytes(&public_key_bytes)?;
+    let claims = public_key.verify_token::<ExternalAccessTokenClaims>(&jwt, verify_options)?;
+
+    let scope = if claims.custom.scope.is_empty() {
+        AuthScope::Access
+    } else {
+        AuthScope::from_str(&claims.custom.scope)?
+    };
+    let iss = claims.issuer.clone();
+    let sub = claims.subject.or_else(|| iss.clone());
+
+    match iss.as_deref() {
+        Some(issuer) if issuer == entryway.url => {}
+        Some(issuer) => bail!(
+            "UntrustedIss: expected external authorization issuer `{}`, got `{issuer}`",
+            entryway.url
+        ),
+        None => bail!("UntrustedIss: missing token issuer"),
+    }
+
+    Ok(JwtPayload {
+        scope,
+        sub,
+        iss,
+        aud: claims.audiences,
+        exp: claims.expires_at,
+        iat: claims.issued_at,
+        jti: claims.jwt_id,
+        cnf_jkt: claims.custom.cnf.and_then(|cnf| cnf.jkt),
+        external_issuer: true,
     })
 }
 

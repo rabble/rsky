@@ -8,6 +8,8 @@ use rocket::request::FromParam;
 use rocket::serde::json::Json;
 use rocket::{response, Data, Request, Responder};
 
+pub mod oauth;
+
 #[derive(Responder)]
 #[response(status = 200)]
 pub struct ProxyResponder(Vec<u8>, Header<'static>, Header<'static>);
